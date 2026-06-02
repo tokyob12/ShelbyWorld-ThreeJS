@@ -25,7 +25,7 @@ npm-debug.log*
 # EXCLUDED gameplay ASSETS
 # Keeps your GitHub repository lightweight and fast to clone
 # ===================================================================
-public/
+public/model/
 *.glb
 *.gltf
 *.hdr
