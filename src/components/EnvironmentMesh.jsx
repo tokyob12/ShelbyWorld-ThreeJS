@@ -1,40 +1,43 @@
 import React, { useEffect, useState } from 'react';
-import { useGLTF } from '@react-three/drei';
+import { useGLTF, Html } from '@react-three/drei'; // Imported Html for error feedback
 import { RigidBody } from '@react-three/rapier';
 import { SHELBY_URLS } from '../constants/urls';
 
-// High-performance chunk-streaming downloader
-async function fetchChunkedBlob(url, chunkSize = 8 * 1024 * 1024) {
-  const initRes = await fetch(url, { headers: { 'Range': 'bytes=0-0' } });
-  if (!initRes.ok) throw new Error("Connection failed");
-  
-  const contentRange = initRes.headers.get('content-range');
-  if (!contentRange) {
-    console.warn("Ranges not supported, downloading standard...");
-    const res = await fetch(url);
-    return await res.blob();
+// =========================================================================
+// CORS-SAFE NATIVE STREAM READER (100% Shelby-Native)
+// Downloads the binary file incrementally as a ReadableStream.
+// Since it does not send custom "Range" headers, it completely bypasses
+// CORS preflight blocks, making it fully compatible with Netlify.
+// =========================================================================
+async function fetchStreamedBlob(url, onProgress) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch. Status: ${response.status}`);
   }
   
-  const totalSize = parseInt(contentRange.split('/')[1]);
-  const chunks = [];
-  let downloadedBytes = 0;
+  const reader = response.body.getReader();
+  const contentLength = +response.headers.get('Content-Length') || 0;
   
-  while (downloadedBytes < totalSize) {
-    const start = downloadedBytes;
-    const end = Math.min(start + chunkSize - 1, totalSize - 1);
+  const chunks = [];
+  let receivedBytes = 0;
+  
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
     
-    const chunkRes = await fetch(url, { headers: { 'Range': `bytes=${start}-${end}` } });
-    if (!chunkRes.ok) throw new Error("Chunk download failed");
+    chunks.push(value);
+    receivedBytes += value.length;
     
-    const buffer = await chunkRes.arrayBuffer();
-    chunks.push(new Uint8Array(buffer));
-    downloadedBytes += buffer.byteLength;
+    if (contentLength && onProgress) {
+      const pct = (receivedBytes / contentLength) * 100;
+      onProgress(pct);
+    }
   }
   
   return new Blob(chunks, { type: 'application/octet-stream' });
 }
 
-export default function EnvironmentMesh({ onEnvironmentLoaded }) { // Prop added (Step 1)
+export default function EnvironmentMesh({ onEnvironmentLoaded }) {
   const [blobUrl, setBlobUrl] = useState(null);
   const [error, setError] = useState(null);
 
@@ -42,18 +45,18 @@ export default function EnvironmentMesh({ onEnvironmentLoaded }) { // Prop added
     let active = true;
     let localUrl = null;
 
-    fetchChunkedBlob(SHELBY_URLS.environment)
+    // Fetch directly and exclusively from the Shelby Storage Network
+    fetchStreamedBlob(SHELBY_URLS.environment)
       .then((blob) => {
         if (!active) return;
         localUrl = URL.createObjectURL(blob);
         setBlobUrl(localUrl);
-        onEnvironmentLoaded(true); // Trigger parent callback: Environment is ready!
+        onEnvironmentLoaded(true); // Unlock start button
       })
       .catch((err) => {
         if (!active) return;
-        console.error("Shelby chunked download failed, reverting to local backup:", err);
+        console.error("Shelby streaming failed:", err);
         setError(err);
-        onEnvironmentLoaded(true); // Trigger parent callback so game can run on local fallback
       });
 
     return () => {
@@ -65,7 +68,27 @@ export default function EnvironmentMesh({ onEnvironmentLoaded }) { // Prop added
   }, [onEnvironmentLoaded]);
 
   if (error) {
-    return <EnvironmentMeshLocal />;
+    // Removed local fallback entirely as requested. 
+    // Shows a warning overlay if the gateway terminates the connection mid-transfer.
+    return (
+      <Html center style={{ pointerEvents: 'none' }}>
+        <div style={{
+          backgroundColor: 'rgba(255, 68, 68, 0.95)',
+          color: 'white',
+          border: '2px solid #ff4444',
+          padding: '16px 24px',
+          borderRadius: '4px',
+          fontSize: '14px',
+          fontWeight: 'bold',
+          letterSpacing: '1px',
+          fontFamily: 'Space Grotesk, sans-serif',
+          whiteSpace: 'nowrap',
+          boxShadow: '0 0 15px rgba(255, 68, 68, 0.4)'
+        }}>
+          SHELBY OUTPOST STREAM ABORTED (HTTP/2 LIMIT EXCEEDED)
+        </div>
+      </Html>
+    );
   }
 
   if (!blobUrl) {
@@ -99,23 +122,4 @@ function EnvironmentMeshRenderer({ url }) {
   );
 }
 
-function EnvironmentMeshLocal() {
-  const { scene } = useGLTF('/model/test33.glb');
-  
-  useEffect(() => {
-    scene.traverse((node) => {
-      if (node.isMesh) {
-        node.castShadow = true;
-        node.receiveShadow = true;
-      }
-    });
-  }, [scene]);
-
-  return (
-    <RigidBody type="fixed" colliders="trimesh" scale={1.5} position={[0, 0, 0]}>
-      <primitive object={scene} />
-    </RigidBody>
-  );
-}
-
-useGLTF.preload('/model/test33.glb');
+useGLTF.preload(SHELBY_URLS.environment);
