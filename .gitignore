@@ -1,0 +1,32 @@
+# Dependency directories
+node_modules/
+
+# Vite/Bundler Caches
+.vite/
+.vite-inspect/
+
+# Build Output
+dist/
+dist-ssr/
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local environment variables
+.env
+.env.local
+
+# ===================================================================
+# EXCLUDED gameplay ASSETS
+# Keeps your GitHub repository lightweight and fast to clone
+# ===================================================================
+public/
+*.glb
+*.gltf
+*.hdr
+# ===================================================================

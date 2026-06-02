@@ -1,0 +1,68 @@
+---
+compiled_package_info:
+  package_name: ShelbyworldQuest
+  address_alias_instantiation:
+    Extensions: "0000000000000000000000000000000000000000000000000000000000000001"
+    admin_addr: 8ec6f91e25f8d7a9d14abd36956019583512fd5142aa82e92e3aed494a40b386
+    aptos_framework: "0000000000000000000000000000000000000000000000000000000000000001"
+    aptos_fungible_asset: 000000000000000000000000000000000000000000000000000000000000000a
+    aptos_std: "0000000000000000000000000000000000000000000000000000000000000001"
+    aptos_token: "0000000000000000000000000000000000000000000000000000000000000003"
+    aptos_token_objects: "0000000000000000000000000000000000000000000000000000000000000004"
+    core_resources: 000000000000000000000000000000000000000000000000000000000a550c18
+    game_addr: 684a223128e42522169840148c8e70e46c785ca15f4582b89ca9118a7af28b53
+    std: "0000000000000000000000000000000000000000000000000000000000000001"
+    vm: "0000000000000000000000000000000000000000000000000000000000000000"
+    vm_reserved: "0000000000000000000000000000000000000000000000000000000000000000"
+  source_digest: A596F6542B01BA7DBB76624730A4ADAB575B06C835E75F1DBDF850745381B4A0
+  build_flags:
+    dev_mode: false
+    test_mode: false
+    verify_mode: false
+    override_std: ~
+    generate_docs: false
+    generate_abis: false
+    generate_move_model: true
+    full_model_generation: true
+    install_dir: ~
+    force_recompilation: false
+    additional_named_addresses:
+      admin_addr: 8ec6f91e25f8d7a9d14abd36956019583512fd5142aa82e92e3aed494a40b386
+      game_addr: 684a223128e42522169840148c8e70e46c785ca15f4582b89ca9118a7af28b53
+    forced_named_addresses: {}
+    fetch_deps_only: false
+    skip_fetch_latest_git_deps: false
+    compiler_config:
+      bytecode_version: 9
+      known_attributes:
+        - bytecode_instruction
+        - deprecated
+        - event
+        - expected_failure
+        - "fmt::skip"
+        - legacy_entry_fun
+        - "lint::allow_unsafe_randomness"
+        - "lint::skip"
+        - module_lock
+        - "mutation::skip"
+        - native_interface
+        - persistent
+        - randomness
+        - resource_group
+        - resource_group_member
+        - test
+        - test_only
+        - verify_only
+        - view
+      skip_attribute_checks: false
+      compiler_version: V2_0
+      language_version: "2.3"
+      experiments:
+        - optimize=on
+      print_errors: true
+dependencies:
+  - AptosFramework
+  - AptosStdlib
+  - AptosTokenObjects
+  - MoveStdlib
+bytecode_deps: []

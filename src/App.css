@@ -1,0 +1,28 @@
+:root {
+  --shelby-cyan: #00E5FF;
+  --shelby-cyan-glow: rgba(0, 229, 255, 0.6);
+  --bg-dark: #050508;
+  --text-main: #ffffff;
+  --text-muted: #8892b0;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-dark);
+  font-family: 'Space Grotesk', sans-serif;
+  overflow: hidden;
+}
+
+/* Animations */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeDown {
+  from { opacity: 0; transform: translateY(-20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
