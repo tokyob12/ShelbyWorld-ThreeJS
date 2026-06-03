@@ -4,7 +4,7 @@ import { RigidBody } from '@react-three/rapier';
 import { useFrame } from '@react-three/fiber';
 
 export default function ShelbyKeyItem({ position, onCollect }) {
-  const { scene } = useGLTF('/model/key.glb');
+  const { scene } = useGLTF(SHELBY_URLS.key); 
   const meshRef = useRef();
   const collected = useRef(false);
 
