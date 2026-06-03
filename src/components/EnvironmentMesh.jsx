@@ -1,13 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import { useGLTF, Html } from '@react-three/drei'; // Imported Html for error feedback
+import { useGLTF, Html } from '@react-three/drei';
 import { RigidBody } from '@react-three/rapier';
 import { SHELBY_URLS } from '../constants/urls';
 
 // =========================================================================
-// CORS-SAFE NATIVE STREAM READER (100% Shelby-Native)
-// Downloads the binary file incrementally as a ReadableStream.
-// Since it does not send custom "Range" headers, it completely bypasses
-// CORS preflight blocks, making it fully compatible with Netlify.
+// STABLE NATIVE BLOB FETCH (100% Shelby-Native & HTTP/2 Safe)
+// Uses the browser's native background network engine to download the blob.
+// This prevents main-thread JS delays from causing HTTP/2 RST_STREAM timeouts.
 // =========================================================================
 async function fetchStreamedBlob(url, onProgress) {
   const response = await fetch(url);
@@ -15,26 +14,10 @@ async function fetchStreamedBlob(url, onProgress) {
     throw new Error(`Failed to fetch. Status: ${response.status}`);
   }
   
-  const reader = response.body.getReader();
-  const contentLength = +response.headers.get('Content-Length') || 0;
-  
-  const chunks = [];
-  let receivedBytes = 0;
-  
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    
-    chunks.push(value);
-    receivedBytes += value.length;
-    
-    if (contentLength && onProgress) {
-      const pct = (receivedBytes / contentLength) * 100;
-      onProgress(pct);
-    }
-  }
-  
-  return new Blob(chunks, { type: 'application/octet-stream' });
+  // Leverage native browser-optimized engine instead of custom getReader() loops
+  const blob = await response.blob();
+  if (onProgress) onProgress(100); // Instantly set loading to 100% when finished
+  return blob;
 }
 
 export default function EnvironmentMesh({ onEnvironmentLoaded }) {
@@ -45,7 +28,7 @@ export default function EnvironmentMesh({ onEnvironmentLoaded }) {
     let active = true;
     let localUrl = null;
 
-    // Fetch directly and exclusively from the Shelby Storage Network
+    // Fetch directly from the Shelby Storage Network
     fetchStreamedBlob(SHELBY_URLS.environment)
       .then((blob) => {
         if (!active) return;
@@ -68,8 +51,6 @@ export default function EnvironmentMesh({ onEnvironmentLoaded }) {
   }, [onEnvironmentLoaded]);
 
   if (error) {
-    // Removed local fallback entirely as requested. 
-    // Shows a warning overlay if the gateway terminates the connection mid-transfer.
     return (
       <Html center style={{ pointerEvents: 'none' }}>
         <div style={{
@@ -121,5 +102,3 @@ function EnvironmentMeshRenderer({ url }) {
     </RigidBody>
   );
 }
-
-useGLTF.preload(SHELBY_URLS.environment);

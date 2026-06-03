@@ -3,8 +3,12 @@ import { useGLTF } from '@react-three/drei';
 import { RigidBody } from '@react-three/rapier';
 import { useFrame } from '@react-three/fiber';
 
+// Add this line to import the Shelby URLs
+import { SHELBY_URLS } from '../constants/urls';
+
 export default function ShelbyKeyItem({ position, onCollect }) {
-  const { scene } = useGLTF(SHELBY_URLS.key); 
+  // Use SHELBY_URLS.key to retrieve the model from Shelby Storage
+  const { scene } = useGLTF(SHELBY_URLS.key);
   const meshRef = useRef();
   const collected = useRef(false);
 
@@ -33,4 +37,5 @@ export default function ShelbyKeyItem({ position, onCollect }) {
   );
 }
 
-useGLTF.preload('/model/key.glb');
+// Preload the key model from the correct Shelby URL
+useGLTF.preload(SHELBY_URLS.key);

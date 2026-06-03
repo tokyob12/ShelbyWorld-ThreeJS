@@ -118,7 +118,9 @@ export class ShelbyManager {
 
       // 2. ARCHIVE TO SHELBY VIA SEQUENTIAL LOG PROTOCOL
       try {
+       // Initialize client targeting the custom "shelbynet" network
         const shelbyClient = new ShelbyClient({ network: "shelbynet" });
+        
         const pKey = new Ed25519PrivateKey(this.SPONSOR_PRIVATE_KEY_HEX);
         const sponsorSigner = Account.fromPrivateKey({ privateKey: pKey });
         const sponsorAddress = sponsorSigner.accountAddress.toString();
@@ -140,14 +142,22 @@ export class ShelbyManager {
         const sequentialBlobName = `Shelby_score_${nextIndex}.json`;
         console.log(`📤 [SHELBY INDEXER] Next available slot found: ${sequentialBlobName}`);
 
+        // Encode JSON payload into binary array with explicit totalBytes options
         const textEncoder = new TextEncoder();
         const blobData = textEncoder.encode(JSON.stringify(localRecord));
+        const totalBytes = blobData.length;
 
+        // Set testnet-compatible 30-day expiration (in microseconds)
+        const thirtyDaysInMicros = 86400 * 30 * 1000000;
+        const expirationMicros = Date.now() * 1000 + thirtyDaysInMicros;
+
+        // Upload with explicit totalBytes options to prevent stream-detection issues
         await shelbyClient.upload({
           blobData,
           signer: sponsorSigner, 
           blobName: sequentialBlobName,
-          expirationMicros: Date.now() * 1000 + (86400 * 365 * 1000000)
+          expirationMicros,
+          totalBytes
         });
 
         console.log("✅ [SHELBY SUCCESS] Player session data successfully stored on Shelby Storage!");
