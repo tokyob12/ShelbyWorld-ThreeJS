@@ -7,9 +7,11 @@ export class ShelbyManager {
   static isConnected = false;
   static activeWallet = null; 
 
+  // Aptos Smart Contract Modules
   static SHELBY_MODULE_ADDRESS = "0x684a223128e42522169840148c8e70e46c785ca15f4582b89ca9118a7af28b53::game_protocol"; 
 
-  static SPONSOR_PRIVATE_KEY_HEX = "0xfbfc29690378b7bc5465b6a1266b29fdd0cad279e9bf047b4d0bb933ef8103d0"; 
+  // Load private key from the local .env file securely
+  static SPONSOR_PRIVATE_KEY_HEX = import.meta.env.VITE_SPONSOR_PRIVATE_KEY; 
 
   static async getStandardWallet() {
     const { aptosWallets, on } = getAptosWallets();
@@ -81,7 +83,7 @@ export class ShelbyManager {
     }
 
     try {
-      // 1. EXECUTE ON-CHAIN MINTING TRANSACTION
+      // 1. EXECUTE ON-CHAIN MINTING TRANSACTION (SIGNED BY PLAYER)
       const transactionFeature = this.activeWallet.features["aptos:signAndSubmitTransaction"];
       if (!transactionFeature) {
         throw new Error("Wallet does not support transaction signing.");
@@ -116,11 +118,13 @@ export class ShelbyManager {
         console.warn("Failed to write local backup score:", localErr);
       }
 
-      // 2. ARCHIVE TO SHELBY VIA SEQUENTIAL LOG PROTOCOL
+      // 2. ARCHIVE TO SHELBY VIA SEQUENTIAL LOG PROTOCOL (SIGNED BY SPONSOR)
       try {
-       // Initialize client targeting the custom "shelbynet" network
+        if (!this.SPONSOR_PRIVATE_KEY_HEX) {
+          throw new Error("Sponsor private key not configured in .env file.");
+        }
+
         const shelbyClient = new ShelbyClient({ network: "shelbynet" });
-        
         const pKey = new Ed25519PrivateKey(this.SPONSOR_PRIVATE_KEY_HEX);
         const sponsorSigner = Account.fromPrivateKey({ privateKey: pKey });
         const sponsorAddress = sponsorSigner.accountAddress.toString();
@@ -129,7 +133,7 @@ export class ShelbyManager {
         let nextIndex = 0;
         let slotFound = false;
 
-        while (!slotFound && nextIndex < 100) { // Limit to 100 safety cap
+        while (!slotFound && nextIndex < 100) { 
           const checkUrl = `https://api.shelbynet.shelby.xyz/shelby/v1/blobs/${sponsorAddress}/Shelby_score_${nextIndex}.json`;
           const res = await fetch(checkUrl);
           if (res.status === 404) {
@@ -151,7 +155,6 @@ export class ShelbyManager {
         const thirtyDaysInMicros = 86400 * 30 * 1000000;
         const expirationMicros = Date.now() * 1000 + thirtyDaysInMicros;
 
-        // Upload with explicit totalBytes options to prevent stream-detection issues
         await shelbyClient.upload({
           blobData,
           signer: sponsorSigner, 
@@ -175,44 +178,67 @@ export class ShelbyManager {
     }
   }
 
+  // =========================================================================
+  // HIGH-PERFORMANCE BATCH LEADERBOARD EXTRACTOR
+  // Fetches score files in parallel batches of 10. Stops immediately 
+  // on the first 404 inside a batch since slots are contiguous.
+  // =========================================================================
   static async fetchLeaderboard() {
     try {
+      if (!this.SPONSOR_PRIVATE_KEY_HEX) {
+        throw new Error("Sponsor private key not configured in .env file.");
+      }
+
       const pKey = new Ed25519PrivateKey(this.SPONSOR_PRIVATE_KEY_HEX);
       const sponsorSigner = Account.fromPrivateKey({ privateKey: pKey });
       const sponsorAddress = sponsorSigner.accountAddress.toString();
       
       const liveRecords = [];
-      let currentIndex = 0;
-      let endOfList = false;
+      const BATCH_SIZE = 10;
+      const MAX_SLOTS = 100;
+      let start = 0;
 
-      console.log("🔍 [SHELBY LEADERBOARD] Fetching sequential player logs...");
+      console.log("🔍 [SHELBY LEADERBOARD] Fetching sequential player logs in parallel batches...");
 
-      // Download sequential logs until we hit the first 404 (representing the end of the folder)
-      while (!endOfList && currentIndex < 100) {
-        const fileUrl = `https://api.shelbynet.shelby.xyz/shelby/v1/blobs/${sponsorAddress}/Shelby_score_${currentIndex}.json`;
-        try {
-          const res = await fetch(fileUrl);
-          if (res.ok) {
-            const data = await res.json();
-            liveRecords.push(data);
-            currentIndex++;
-          } else if (res.status === 404) {
-            endOfList = true; // Stop loop immediately on first missing file
-          } else {
-            currentIndex++; // Skip on unhandled errors
+      while (start < MAX_SLOTS) {
+        const batch = Array.from({ length: BATCH_SIZE }, (_, i) => start + i);
+
+        // Fetch 10 scores simultaneously
+        const results = await Promise.all(
+          batch.map(async (idx) => {
+            const url = `https://api.shelbynet.shelby.xyz/shelby/v1/blobs/${sponsorAddress}/Shelby_score_${idx}.json`;
+            try {
+              const res = await fetch(url);
+              if (res.ok) {
+                const data = await res.json();
+                return { data, idx };
+              }
+              return { data: null, idx }; 
+            } catch (err) {
+              return { data: null, idx };
+            }
+          })
+        );
+
+        // Sort batch results sequentially by index to maintain correct order
+        results.sort((a, b) => a.idx - b.idx);
+
+        let hitEnd = false;
+        for (const item of results) {
+          if (item.data === null) {
+            hitEnd = true;
+            break; // Stop compiling once the first unoccupied slot (404) is reached
           }
-        } catch (err) {
-          endOfList = true; // Fail safe on network disconnect
+          liveRecords.push(item.data);
         }
+
+        if (hitEnd) break; // Terminate outer loop immediately on end-of-list
+        start += BATCH_SIZE;
       }
 
       console.log(`📦 [SHELBY LEADERBOARD] Loaded ${liveRecords.length} unique player session files.`);
 
-      // ===================================================================
-      // PERSONAL BEST DEDUPLICATION REDUCER
-      // Groups all sessions by wallet address and preserves only their
-      // single highest score (and fastest speedrun time for score ties).
-      // ===================================================================
+      // Personal Best Deduplication Reducer
       const bestRecordsMap = new Map();
       liveRecords.forEach((record) => {
         const wallet = record.wallet_address;
