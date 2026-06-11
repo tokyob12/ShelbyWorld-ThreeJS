@@ -256,8 +256,7 @@ export default function WelcomeOverlay({ onStart, isEngineReady, loadingProgress
             {/* Start Game Action */}
             <button 
               disabled={isStartButtonDisabled}
-              onClick={() => onStart(walletAddress)}
-              style={{
+              onClick={() => onStart(walletAddress, ShelbyManager.walletAddress)}              style={{
                 padding: '1rem 3rem',
                 fontFamily: 'Space Grotesk, sans-serif',
                 fontSize: '1rem',

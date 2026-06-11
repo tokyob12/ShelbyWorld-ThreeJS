@@ -14,7 +14,7 @@ export class ShelbyManager {
     "0x684a223128e42522169840148c8e70e46c785ca15f4582b89ca9118a7af28b53::game_protocol";
   static SPONSOR_PRIVATE_KEY_HEX = import.meta.env.VITE_SPONSOR_PRIVATE_KEY;
 
-  // Lazily created — building the erasure coding provider (WASM) is expensive
+  // Lazily created — WASM erasure-coding provider init is expensive
   static _client = null;
   static _getClient() {
     if (!this._client) this._client = new ShelbyClient({ network: "shelbynet" });
@@ -96,89 +96,156 @@ export class ShelbyManager {
     return Account.fromPrivateKey({ privateKey: pKey });
   }
 
-  // Direct blob GET — only call this after confirming existence via getBlobMetadata.
-  static async _fetchLeaderboardBlob(sponsorAddress) {
-    const url = `${SHELBY_API}/${sponsorAddress}/${LEADERBOARD_BLOB}`;
+  // Direct blob GET. Returns null on 404 (no data yet), throws on other errors.
+  // Does NOT use the Aptos indexer — reads directly from the storage layer,
+  // so it is not affected by indexer lag after a recent write.
+  static async _fetchBlob(sponsorAddress, blobName) {
+    const url = `${SHELBY_API}/${sponsorAddress}/${blobName}`;
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`Failed to fetch leaderboard.json: ${res.status}`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`Failed to fetch ${blobName}: ${res.status}`);
     return res.json();
   }
 
-  // Write records as leaderboard.json.
+  // Delete-then-upload. Shelby blobs are immutable — uploading different bytes
+  // under the same registered name causes HTTP 400 at the multipart /complete
+  // step. We must delete the old on-chain registration before re-registering.
   //
-  // Shelby blobs are IMMUTABLE — registration pins the merkle root + byte size
-  // on-chain. Uploading different bytes under the same name skips re-registration
-  // (SDK finds the existing on-chain entry) but the storage layer then rejects
-  // the mismatched content at the multipart /complete step with HTTP 400.
-  // The correct update pattern is: delete old registration → upload fresh.
-  static async _uploadLeaderboardBlob(records, sponsorSigner) {
+  // The 1.5 s pause after deleteBlob lets the Aptos RPC node and indexer sync
+  // before client.upload() internally calls getBlobMetadata(). Without it,
+  // the SDK sees the old registration (indexer lag), skips re-registration,
+  // and putBlobResumable fails with HTTP 400 because the bytes no longer match
+  // the stale on-chain merkle root.
+  static async _writeBlob(data, blobName, sponsorSigner) {
     const client = this._getClient();
-    const account = sponsorSigner.accountAddress;
 
-    // Check on-chain registration (indexer query — always 200, never a red 404)
-    let exists = false;
+    // Check existence via indexer. If the indexer is lagging and misses an
+    // existing blob here, we'll catch the EALREADY_EXISTS error below.
+    let existsMeta = null;
     try {
-      const meta = await client.coordination.getBlobMetadata({
-        account,
-        name: LEADERBOARD_BLOB,
+      existsMeta = await client.coordination.getBlobMetadata({
+        account: sponsorSigner.accountAddress,
+        name: blobName,
       });
-      exists = !!meta;
-    } catch (_) {
-      exists = false;
-    }
+    } catch (_) {}
 
-    if (exists) {
-      console.log("[SHELBY] Deleting old leaderboard.json registration...");
+    if (existsMeta) {
+      console.log(`[SHELBY] Deleting old ${blobName} registration...`);
       const { transaction } = await client.coordination.deleteBlob({
         account: sponsorSigner,
-        blobName: LEADERBOARD_BLOB,
+        blobName,
       });
       await client.aptos.waitForTransaction({ transactionHash: transaction.hash });
+      // Give the indexer / RPC node time to reflect the deletion before
+      // client.upload() queries getBlobMetadata() internally.
+      await new Promise((r) => setTimeout(r, 1500));
     }
 
-    const blobData = new TextEncoder().encode(JSON.stringify(records));
-    const thirtyDaysInMicros = 86400 * 30 * 1_000_000;
-    const expirationMicros = Date.now() * 1000 + thirtyDaysInMicros;
+    const blobData = new TextEncoder().encode(JSON.stringify(data));
+    const expirationMicros = Date.now() * 1000 + 86400 * 30 * 1_000_000;
 
-    await client.upload({
-      blobData,
-      signer: sponsorSigner,
-      blobName: LEADERBOARD_BLOB,
-      expirationMicros,
-    });
+    await client.upload({ blobData, signer: sponsorSigner, blobName, expirationMicros });
+    console.log(`[SHELBY] ✅ ${blobName} written → ${SHELBY_API}/${sponsorSigner.accountAddress}/${blobName}`);
   }
 
-  // Merge newRecord into records keeping personal best per wallet.
+  // Merge newRecord into records, keeping personal best per wallet.
   // Higher score wins; fastest time_elapsed breaks ties.
-  // Returns a new array sorted: score desc, time_elapsed asc.
   static _mergeRecord(records, newRecord) {
     const map = new Map();
-
     for (const r of records) {
       if (!r.wallet_address) continue;
-      const existing = map.get(r.wallet_address);
-      if (
-        !existing ||
-        r.score > existing.score ||
-        (r.score === existing.score && r.time_elapsed < existing.time_elapsed)
-      ) {
+      const ex = map.get(r.wallet_address);
+      if (!ex || r.score > ex.score || (r.score === ex.score && r.time_elapsed < ex.time_elapsed)) {
         map.set(r.wallet_address, r);
       }
     }
-
-    const current = map.get(newRecord.wallet_address);
-    if (
-      !current ||
-      newRecord.score > current.score ||
-      (newRecord.score === current.score &&
-        newRecord.time_elapsed < current.time_elapsed)
-    ) {
+    const cur = map.get(newRecord.wallet_address);
+    if (!cur || newRecord.score > cur.score || (newRecord.score === cur.score && newRecord.time_elapsed < cur.time_elapsed)) {
       map.set(newRecord.wallet_address, newRecord);
     }
-
     return Array.from(map.values()).sort(
       (a, b) => b.score - a.score || a.time_elapsed - b.time_elapsed
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // DYNAMIC PASSPORT — save
+  // ---------------------------------------------------------------------------
+
+  static async savePlayerPassport(walletAddress, credits, timeElapsed) {
+    try {
+      const sponsorSigner = this._getSponsorSigner();
+      const sponsorAddress = sponsorSigner.accountAddress.toString();
+      const blobName = `${walletAddress}_passport.json`;
+
+      // Read existing passport directly — no indexer, no 404 risk
+      const prev = await this._fetchBlob(sponsorAddress, blobName);
+
+      const prevCredits = prev?.attributes?.find((a) => a.trait_type === "Decryption Credits")?.value ?? -1;
+      const prevTime    = prev?.attributes?.find((a) => a.trait_type === "Speedrun Time")?.value ?? Infinity;
+      const prevRuns    = prev?.attributes?.find((a) => a.trait_type === "Total Runs")?.value ?? 0;
+
+      const isPersonalBest =
+        credits > prevCredits || (credits === prevCredits && timeElapsed < prevTime);
+
+      const bestCredits = isPersonalBest ? credits : prevCredits;
+      const bestTime    = isPersonalBest ? timeElapsed : (prevTime === Infinity ? timeElapsed : prevTime);
+
+      const passport = {
+        name: "ShelbyWorld Quest — Portal Pass",
+        description:
+          "A dynamic on-chain passport minted via ShelbyWorld Quest. Attributes are mutable and update on every personal-best run — stored on Shelby decentralized hot storage.",
+        image:
+          "https://api.shelbynet.shelby.xyz/shelby/v1/blobs/0x236f14622de45f2f2246df2a0736d6ccbbbbbd23e4c7570ad3378cfdfaa589d5/model/logo.glb",
+        external_url: "https://shelbyworld.netlify.app",
+        attributes: [
+          { trait_type: "Decryption Credits", value: bestCredits },
+          { trait_type: "Speedrun Time",      value: bestTime },
+          { trait_type: "Completed Levels",   value: 1 },
+          { trait_type: "Outpost Secured",    value: "Yes" },
+          { trait_type: "Total Runs",         value: prevRuns + 1 },
+          { trait_type: "Network",            value: "Aptos Testnet" },
+          { trait_type: "Storage Layer",      value: "Shelby Decentralized Storage" },
+        ],
+        wallet_address: walletAddress,
+        last_updated: Date.now(),
+      };
+
+      console.log(
+        `[PASSPORT] ${isPersonalBest ? "NEW PERSONAL BEST" : "Run logged"} — ${walletAddress.substring(0, 8)}... (best: ${bestCredits} CR)`
+      );
+      await this._writeBlob(passport, blobName, sponsorSigner);
+      return passport;
+    } catch (err) {
+      console.warn("[PASSPORT] Failed to save passport — game continues normally:", err);
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // DYNAMIC PASSPORT — fetch
+  // ---------------------------------------------------------------------------
+
+  static async fetchPlayerPassport(walletAddress) {
+    try {
+      const sponsorSigner = this._getSponsorSigner();
+      const sponsorAddress = sponsorSigner.accountAddress.toString();
+      const blobName = `${walletAddress}_passport.json`;
+
+      // Direct fetch — null on 404 (first-time player), no indexer lag
+      const passport = await this._fetchBlob(sponsorAddress, blobName);
+      if (!passport) {
+        console.log(`[PASSPORT] No passport for ${walletAddress.substring(0, 8)}... (first-time player)`);
+        return null;
+      }
+
+      const best = passport.attributes?.find((a) => a.trait_type === "Decryption Credits")?.value ?? "?";
+      console.log(`[PASSPORT] ✅ Loaded — best score: ${best} CR`);
+      return passport;
+    } catch (err) {
+      console.warn("[PASSPORT] Failed to fetch passport:", err);
+      return null;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -220,52 +287,29 @@ export class ShelbyManager {
         timestamp: Date.now(),
       };
 
-      // Local fallback written first — score is safe even if Shelby upload fails
+      // Local fallback — score is safe even if Shelby upload fails
       try {
-        localStorage.setItem(
-          `shelby_score_${this.walletAddress}`,
-          JSON.stringify(newRecord)
-        );
+        localStorage.setItem(`shelby_score_${this.walletAddress}`, JSON.stringify(newRecord));
       } catch (e) {
         console.warn("Local backup write failed:", e);
       }
 
-      // Step 2 — read → merge → delete → rewrite leaderboard.json (sponsor pays)
+      // Step 2 — update unified leaderboard blob
       try {
         const sponsorSigner = this._getSponsorSigner();
         const sponsorAddress = sponsorSigner.accountAddress.toString();
 
-        // Check existence on-chain before attempting a blob GET (avoids red 404)
-        let existing = [];
-        let existingMeta;
-        try {
-          existingMeta = await this._getClient().coordination.getBlobMetadata({
-            account: sponsorSigner.accountAddress,
-            name: LEADERBOARD_BLOB,
-          });
-        } catch (_) {
-          existingMeta = undefined;
-        }
-
-        if (existingMeta) {
-          console.log("[SHELBY] Fetching current leaderboard.json...");
-          existing = await this._fetchLeaderboardBlob(sponsorAddress);
-        } else {
-          console.log("[SHELBY] No leaderboard.json yet — starting fresh.");
-        }
-
+        // Direct fetch — bypasses indexer, no race condition with recent mint tx
+        const existing = (await this._fetchBlob(sponsorAddress, LEADERBOARD_BLOB)) ?? [];
         const updated = this._mergeRecord(existing, newRecord);
         console.log(`[SHELBY] Uploading leaderboard.json (${updated.length} records)...`);
-        await this._uploadLeaderboardBlob(updated, sponsorSigner);
-        console.log(
-          `[SHELBY] ✅ leaderboard.json updated → ${SHELBY_API}/${sponsorAddress}/${LEADERBOARD_BLOB}`
-        );
+        await this._writeBlob(updated, LEADERBOARD_BLOB, sponsorSigner);
       } catch (shelbyErr) {
-        console.warn(
-          "Shelby upload failed — on-chain mint and local backup still succeeded:",
-          shelbyErr
-        );
+        console.warn("Shelby leaderboard upload failed — mint and local backup still succeeded:", shelbyErr);
       }
+
+      // Step 3 — create / sync the player's dynamic passport on Shelby
+      await this.savePlayerPassport(this.walletAddress, credits, timeElapsed);
 
       return txHash;
     } catch (error) {
@@ -275,7 +319,7 @@ export class ShelbyManager {
   }
 
   // ---------------------------------------------------------------------------
-  // FETCH LEADERBOARD — 1 request, zero red 404s
+  // FETCH LEADERBOARD — direct read, no indexer, no 404 race
   // ---------------------------------------------------------------------------
 
   static async fetchLeaderboard() {
@@ -283,28 +327,16 @@ export class ShelbyManager {
       const sponsorSigner = this._getSponsorSigner();
       const sponsorAddress = sponsorSigner.accountAddress.toString();
 
-      // Check on-chain first (indexer, always 200). Only do the blob GET when
-      // the file is confirmed to exist — browser cannot suppress red 404s from
-      // fetch() calls even when the promise is caught.
-      let meta;
-      try {
-        meta = await this._getClient().coordination.getBlobMetadata({
-          account: sponsorSigner.accountAddress,
-          name: LEADERBOARD_BLOB,
-        });
-      } catch (_) {
-        meta = undefined;
-      }
-
-      if (!meta) {
-        console.log("[SHELBY] No leaderboard.json on-chain yet — empty leaderboard.");
+      // Direct fetch — null means no one has played yet (first cold start).
+      // No _blobExists / indexer check here, which was the root cause of the
+      // sponsor seeing only their own score immediately after minting.
+      const records = await this._fetchBlob(sponsorAddress, LEADERBOARD_BLOB);
+      if (!records) {
+        console.log("[SHELBY] No leaderboard.json yet — empty leaderboard.");
         return this.mergeWithLocalBackup([]);
       }
 
-      console.log("[SHELBY] Fetching leaderboard.json...");
-      const records = await this._fetchLeaderboardBlob(sponsorAddress);
-      console.log(`[SHELBY] Loaded ${records.length} records.`);
-
+      console.log(`[SHELBY] Loaded ${records.length} records from leaderboard.json.`);
       const sorted = [...records].sort(
         (a, b) => b.score - a.score || a.time_elapsed - b.time_elapsed
       );
@@ -324,8 +356,7 @@ export class ShelbyManager {
     try {
       const raw = localStorage.getItem(`shelby_score_${this.walletAddress}`);
       if (!raw) return liveRecords;
-      const local = JSON.parse(raw);
-      return this._mergeRecord(liveRecords, local);
+      return this._mergeRecord(liveRecords, JSON.parse(raw));
     } catch (e) {
       console.warn("Failed to merge local backup:", e);
       return liveRecords;
