@@ -21,6 +21,11 @@ export class ShelbyManager {
     return this._client;
   }
 
+  // Session cache of passports (walletAddress -> passport | null).
+  // Lets save / post-mint refresh skip network reads, avoiding both the red
+  // 404 on first-time players AND read-after-write races on the same session.
+  static _passportCache = new Map();
+
   // ---------------------------------------------------------------------------
   // WALLET CONNECTION
   // ---------------------------------------------------------------------------
@@ -96,9 +101,19 @@ export class ShelbyManager {
     return Account.fromPrivateKey({ privateKey: pKey });
   }
 
-  // Direct blob GET. Returns null on 404 (no data yet), throws on other errors.
-  // Does NOT use the Aptos indexer — reads directly from the storage layer,
-  // so it is not affected by indexer lag after a recent write.
+  // On-chain existence check via aptos.view() — HTTP 200 even when absent, so
+  // it produces NO red 404 in the console (unlike a direct blob GET).
+  static async _blobExists(account, name) {
+    try {
+      const meta = await this._getClient().coordination.getBlobMetadata({ account, name });
+      return !!meta;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Direct blob GET. Returns null on 404, throws on other errors.
+  // Reads the storage layer directly (no indexer) — immune to indexer lag.
   static async _fetchBlob(sponsorAddress, blobName) {
     const url = `${SHELBY_API}/${sponsorAddress}/${blobName}`;
     const res = await fetch(url);
@@ -107,20 +122,13 @@ export class ShelbyManager {
     return res.json();
   }
 
-  // Delete-then-upload. Shelby blobs are immutable — uploading different bytes
-  // under the same registered name causes HTTP 400 at the multipart /complete
-  // step. We must delete the old on-chain registration before re-registering.
-  //
-  // The 1.5 s pause after deleteBlob lets the Aptos RPC node and indexer sync
-  // before client.upload() internally calls getBlobMetadata(). Without it,
-  // the SDK sees the old registration (indexer lag), skips re-registration,
-  // and putBlobResumable fails with HTTP 400 because the bytes no longer match
-  // the stale on-chain merkle root.
+  // Delete-then-upload. Shelby blobs are immutable — overwriting different bytes
+  // under the same registered name fails with HTTP 400 at multipart /complete.
+  // The 1.5 s pause after deleteBlob lets the node sync before client.upload()
+  // internally re-checks getBlobMetadata().
   static async _writeBlob(data, blobName, sponsorSigner) {
     const client = this._getClient();
 
-    // Check existence via indexer. If the indexer is lagging and misses an
-    // existing blob here, we'll catch the EALREADY_EXISTS error below.
     let existsMeta = null;
     try {
       existsMeta = await client.coordination.getBlobMetadata({
@@ -136,8 +144,6 @@ export class ShelbyManager {
         blobName,
       });
       await client.aptos.waitForTransaction({ transactionHash: transaction.hash });
-      // Give the indexer / RPC node time to reflect the deletion before
-      // client.upload() queries getBlobMetadata() internally.
       await new Promise((r) => setTimeout(r, 1500));
     }
 
@@ -149,7 +155,6 @@ export class ShelbyManager {
   }
 
   // Merge newRecord into records, keeping personal best per wallet.
-  // Higher score wins; fastest time_elapsed breaks ties.
   static _mergeRecord(records, newRecord) {
     const map = new Map();
     for (const r of records) {
@@ -169,17 +174,52 @@ export class ShelbyManager {
   }
 
   // ---------------------------------------------------------------------------
-  // DYNAMIC PASSPORT — save
+  // DYNAMIC PASSPORT — fetch (zero red 404, even for first-time players)
+  // ---------------------------------------------------------------------------
+
+  static async fetchPlayerPassport(walletAddress) {
+    try {
+      // Session cache is authoritative — instant, and correct right after a
+      // write (no read-after-write race on the post-mint HUD refresh).
+      if (this._passportCache.has(walletAddress)) {
+        return this._passportCache.get(walletAddress);
+      }
+
+      const sponsorSigner = this._getSponsorSigner();
+      const sponsorAddress = sponsorSigner.accountAddress.toString();
+      const blobName = `${walletAddress}_passport.json`;
+
+      // Existence check via on-chain view (HTTP 200) — no red 404 for new players
+      const exists = await this._blobExists(sponsorSigner.accountAddress, blobName);
+      if (!exists) {
+        console.log(`[PASSPORT] No passport for ${walletAddress.substring(0, 8)}... (first-time player)`);
+        this._passportCache.set(walletAddress, null);
+        return null;
+      }
+
+      const passport = await this._fetchBlob(sponsorAddress, blobName);
+      this._passportCache.set(walletAddress, passport);
+      const best = passport?.attributes?.find((a) => a.trait_type === "Decryption Credits")?.value ?? "?";
+      console.log(`[PASSPORT] ✅ Loaded — best score: ${best} CR`);
+      return passport;
+    } catch (err) {
+      console.warn("[PASSPORT] Failed to fetch passport:", err);
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // DYNAMIC PASSPORT — save (reads prev from cache → no extra network 404)
   // ---------------------------------------------------------------------------
 
   static async savePlayerPassport(walletAddress, credits, timeElapsed) {
     try {
       const sponsorSigner = this._getSponsorSigner();
-      const sponsorAddress = sponsorSigner.accountAddress.toString();
       const blobName = `${walletAddress}_passport.json`;
 
-      // Read existing passport directly — no indexer, no 404 risk
-      const prev = await this._fetchBlob(sponsorAddress, blobName);
+      // Previous state from the guarded fetch (cache hit, or 200 view-check) —
+      // never a raw blob GET, so no red 404 here.
+      const prev = await this.fetchPlayerPassport(walletAddress);
 
       const prevCredits = prev?.attributes?.find((a) => a.trait_type === "Decryption Credits")?.value ?? -1;
       const prevTime    = prev?.attributes?.find((a) => a.trait_type === "Speedrun Time")?.value ?? Infinity;
@@ -215,35 +255,10 @@ export class ShelbyManager {
         `[PASSPORT] ${isPersonalBest ? "NEW PERSONAL BEST" : "Run logged"} — ${walletAddress.substring(0, 8)}... (best: ${bestCredits} CR)`
       );
       await this._writeBlob(passport, blobName, sponsorSigner);
+      this._passportCache.set(walletAddress, passport); // refresh cache for instant HUD update
       return passport;
     } catch (err) {
       console.warn("[PASSPORT] Failed to save passport — game continues normally:", err);
-      return null;
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // DYNAMIC PASSPORT — fetch
-  // ---------------------------------------------------------------------------
-
-  static async fetchPlayerPassport(walletAddress) {
-    try {
-      const sponsorSigner = this._getSponsorSigner();
-      const sponsorAddress = sponsorSigner.accountAddress.toString();
-      const blobName = `${walletAddress}_passport.json`;
-
-      // Direct fetch — null on 404 (first-time player), no indexer lag
-      const passport = await this._fetchBlob(sponsorAddress, blobName);
-      if (!passport) {
-        console.log(`[PASSPORT] No passport for ${walletAddress.substring(0, 8)}... (first-time player)`);
-        return null;
-      }
-
-      const best = passport.attributes?.find((a) => a.trait_type === "Decryption Credits")?.value ?? "?";
-      console.log(`[PASSPORT] ✅ Loaded — best score: ${best} CR`);
-      return passport;
-    } catch (err) {
-      console.warn("[PASSPORT] Failed to fetch passport:", err);
       return null;
     }
   }
@@ -258,7 +273,6 @@ export class ShelbyManager {
     }
 
     try {
-      // Step 1 — on-chain mint, signed by the player
       const txFeature = this.activeWallet.features["aptos:signAndSubmitTransaction"];
       if (!txFeature) throw new Error("Wallet does not support transaction signing.");
 
@@ -287,19 +301,17 @@ export class ShelbyManager {
         timestamp: Date.now(),
       };
 
-      // Local fallback — score is safe even if Shelby upload fails
       try {
         localStorage.setItem(`shelby_score_${this.walletAddress}`, JSON.stringify(newRecord));
       } catch (e) {
         console.warn("Local backup write failed:", e);
       }
 
-      // Step 2 — update unified leaderboard blob
+      // Update unified leaderboard blob (direct fetch — no indexer race)
       try {
         const sponsorSigner = this._getSponsorSigner();
         const sponsorAddress = sponsorSigner.accountAddress.toString();
 
-        // Direct fetch — bypasses indexer, no race condition with recent mint tx
         const existing = (await this._fetchBlob(sponsorAddress, LEADERBOARD_BLOB)) ?? [];
         const updated = this._mergeRecord(existing, newRecord);
         console.log(`[SHELBY] Uploading leaderboard.json (${updated.length} records)...`);
@@ -308,7 +320,7 @@ export class ShelbyManager {
         console.warn("Shelby leaderboard upload failed — mint and local backup still succeeded:", shelbyErr);
       }
 
-      // Step 3 — create / sync the player's dynamic passport on Shelby
+      // Sync the player's dynamic passport on Shelby
       await this.savePlayerPassport(this.walletAddress, credits, timeElapsed);
 
       return txHash;
@@ -319,7 +331,7 @@ export class ShelbyManager {
   }
 
   // ---------------------------------------------------------------------------
-  // FETCH LEADERBOARD — direct read, no indexer, no 404 race
+  // FETCH LEADERBOARD — direct read (no indexer, no race)
   // ---------------------------------------------------------------------------
 
   static async fetchLeaderboard() {
@@ -327,9 +339,6 @@ export class ShelbyManager {
       const sponsorSigner = this._getSponsorSigner();
       const sponsorAddress = sponsorSigner.accountAddress.toString();
 
-      // Direct fetch — null means no one has played yet (first cold start).
-      // No _blobExists / indexer check here, which was the root cause of the
-      // sponsor seeing only their own score immediately after minting.
       const records = await this._fetchBlob(sponsorAddress, LEADERBOARD_BLOB);
       if (!records) {
         console.log("[SHELBY] No leaderboard.json yet — empty leaderboard.");
