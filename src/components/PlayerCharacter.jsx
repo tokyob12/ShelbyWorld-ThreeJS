@@ -1,15 +1,15 @@
-import React, { useRef, useEffect, useState, useMemo } from 'react';
+import React, { useRef, useEffect, useState } from 'react';
 import * as THREE from 'three';
 import { useGLTF, useAnimations, useKeyboardControls, Html } from '@react-three/drei';
 import { RigidBody, CapsuleCollider } from '@react-three/rapier';
 import { useFrame, useThree } from '@react-three/fiber';
-import { SHELBY_URLS } from '../constants/urls'; // Imported Shelby URLs
+import { SHELBY_URLS } from '../constants/urls';
+import { replayRecorder } from '../managers/ReplayRecorder';
 
 export default function PlayerCharacter({ playerName = "PLAYER" }) {
   const rigidBodyRef = useRef();
   const avatarGroup = useRef();
-  const lastLogTime = useRef(0);
-  
+
   const { gl } = useThree();
 
   const cameraYaw = useRef(0);
@@ -17,7 +17,6 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
   const isDragging = useRef(false);
   const cameraTarget = useRef(new THREE.Vector3());
 
-  // Stream the Meebit avatar model directly from Shelby Storage
   const { scene, animations } = useGLTF(SHELBY_URLS.meebit);
   const { actions } = useAnimations(animations, avatarGroup);
 
@@ -26,11 +25,10 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
 
   useEffect(() => {
     if (animations && animations.length > 0) {
-      console.log(" Meebit animations found in file:", animations.map(a => a.name));
+      console.log("Meebit animations found:", animations.map(a => a.name));
     }
   }, [animations]);
 
-  // Drag-to-Look Event Binding
   useEffect(() => {
     const canvas = gl.domElement;
 
@@ -38,23 +36,15 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
       isDragging.current = true;
       canvas.setPointerCapture(e.pointerId);
     };
-
     const handlePointerUp = (e) => {
       isDragging.current = false;
-      try {
-        canvas.releasePointerCapture(e.pointerId);
-      } catch (err) {}
+      try { canvas.releasePointerCapture(e.pointerId); } catch (err) {}
     };
-
     const handlePointerMove = (e) => {
       if (!isDragging.current) return;
-
       const sensitivity = 0.003;
       cameraYaw.current -= e.movementX * sensitivity;
-      cameraPitch.current = Math.max(
-        -0.2,
-        Math.min(1.0, cameraPitch.current - e.movementY * sensitivity)
-      );
+      cameraPitch.current = Math.max(-0.2, Math.min(1.0, cameraPitch.current - e.movementY * sensitivity));
     };
 
     canvas.addEventListener('pointerdown', handlePointerDown);
@@ -68,24 +58,15 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
     };
   }, [gl]);
 
-  // Animation Blending System
   useEffect(() => {
-    const clipMap = {
-      idle: 'idle',
-      walk: 'run',
-      jump: 'jump'
-    };
-
+    const clipMap = { idle: 'idle', walk: 'run', jump: 'jump' };
     const targetClip = clipMap[animationState] || 'idle';
     let finalClipName = targetClip;
-
     if (targetClip === 'run' && !actions['run']) {
       const foundWalk = animations.find(a => a.name.toLowerCase().includes('walk') || a.name.toLowerCase().includes('run'));
       if (foundWalk) finalClipName = foundWalk.name;
     }
-
     const activeAction = actions[finalClipName];
-
     if (activeAction) {
       activeAction.reset().fadeIn(0.15).play();
       return () => activeAction.fadeOut(0.15);
@@ -99,13 +80,16 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
     const currentVelocity = rigidBodyRef.current.linvel();
     const currentPos = rigidBodyRef.current.translation();
 
-    // High-performance coordinates dispatch
+    // Record position for ghost replay
+    if (avatarGroup.current) {
+      replayRecorder.record(state.clock.elapsedTime, currentPos, avatarGroup.current.rotation.y);
+    }
+
     const coordsEl = document.getElementById('hud-coords-value');
     if (coordsEl) {
       coordsEl.innerText = `X: ${currentPos.x.toFixed(2)} Y: ${currentPos.y.toFixed(2)} Z: ${currentPos.z.toFixed(2)}`;
     }
 
-    // Camera-relative directions
     const cameraForward = new THREE.Vector3();
     state.camera.getWorldDirection(cameraForward);
     cameraForward.y = 0;
@@ -116,17 +100,12 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
       .normalize();
 
     const moveDirection = new THREE.Vector3(0, 0, 0);
-
     if (forward) moveDirection.add(cameraForward);
     if (backward) moveDirection.sub(cameraForward);
     if (left || strafeLeft) moveDirection.sub(cameraRight);
     if (right || strafeRight) moveDirection.add(cameraRight);
+    if (moveDirection.lengthSq() > 0) moveDirection.normalize();
 
-    if (moveDirection.lengthSq() > 0) {
-      moveDirection.normalize();
-    }
-
-    // Smooth turning
     if (moveDirection.lengthSq() > 0) {
       const targetRotationY = Math.atan2(moveDirection.x, moveDirection.z);
       avatarGroup.current.rotation.y = THREE.MathUtils.lerp(
@@ -140,18 +119,13 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
     const speedMultiplier = boost ? 1.8 : 1.0;
     const movementSpeed = baseSpeed * speedMultiplier;
 
-    const velocityX = moveDirection.x * movementSpeed;
-    const velocityZ = moveDirection.z * movementSpeed;
-
-    // Apply linear velocity
     rigidBodyRef.current.setLinvel(
-      { x: velocityX, y: currentVelocity.y, z: velocityZ },
+      { x: moveDirection.x * movementSpeed, y: currentVelocity.y, z: moveDirection.z * movementSpeed },
       true
     );
 
-    // Ground check
     const isOnGround = Math.abs(currentVelocity.y) < 0.3;
-    const isJumpingOrFalling = Math.abs(currentVelocity.y) > 2.0; 
+    const isJumpingOrFalling = Math.abs(currentVelocity.y) > 2.0;
 
     if (jump && isOnGround) {
       rigidBodyRef.current.setLinvel(
@@ -160,9 +134,7 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
       );
     }
 
-    // Determine target animation state
     const isMoving = forward || backward || left || right || strafeLeft || strafeRight;
-
     if (isJumpingOrFalling) {
       if (animationState !== 'jump') setAnimationState('jump');
     } else if (isMoving) {
@@ -171,7 +143,6 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
       if (animationState !== 'idle') setAnimationState('idle');
     }
 
-    // Camera follow offsets
     const cameraDistance = 6.0;
     const offsetVec = new THREE.Vector3(0, 0, cameraDistance);
     offsetVec.applyAxisAngle(new THREE.Vector3(1, 0, 0), cameraPitch.current);
@@ -185,13 +156,7 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
 
     state.camera.position.lerp(targetCameraPosition, 0.08);
 
-    // Smooth Camera Look-At
-    const idealLookTarget = new THREE.Vector3(
-      currentPos.x,
-      currentPos.y + 0.8,
-      currentPos.z
-    );
-
+    const idealLookTarget = new THREE.Vector3(currentPos.x, currentPos.y + 0.8, currentPos.z);
     cameraTarget.current.lerp(idealLookTarget, 0.1);
     state.camera.lookAt(cameraTarget.current);
   });
@@ -210,13 +175,12 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
       ref={rigidBodyRef}
       colliders={false}
       position={[0, 8, 0]}
-      enabledRotations={[false, false, false]} 
+      enabledRotations={[false, false, false]}
       canSleep={false}
       friction={0}
       restitution={0}
     >
       <CapsuleCollider args={[0.65, 0.45]} position={[0, 0.2, 0]} friction={0} restitution={0} />
-
       <Html position={[0, 1.8, 0]} center style={{ pointerEvents: 'none' }}>
         <div style={{
           backgroundColor: 'rgba(5, 5, 8, 0.85)',
@@ -235,7 +199,6 @@ export default function PlayerCharacter({ playerName = "PLAYER" }) {
           {playerName}
         </div>
       </Html>
-
       <group ref={avatarGroup} scale={1.3}>
         <primitive object={scene} position={[0, -0.7, 0]} />
       </group>

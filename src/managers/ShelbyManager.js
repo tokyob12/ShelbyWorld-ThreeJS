@@ -10,31 +10,26 @@ export class ShelbyManager {
   static isConnected = false;
   static activeWallet = null;
 
-  static SHELBY_MODULE_ADDRESS =
-    "0x684a223128e42522169840148c8e70e46c785ca15f4582b89ca9118a7af28b53::game_protocol";
+  static SHELBY_MODULE_ADDRESS = "0x684a223128e42522169840148c8e70e46c785ca15f4582b89ca9118a7af28b53::game_protocol";
   static SPONSOR_PRIVATE_KEY_HEX = import.meta.env.VITE_SPONSOR_PRIVATE_KEY;
 
-  // Lazily created — WASM erasure-coding provider init is expensive
   static _client = null;
+  static _passportCache = new Map();
+
   static _getClient() {
     if (!this._client) this._client = new ShelbyClient({ network: "shelbynet" });
     return this._client;
   }
 
-  // Session cache of passports (walletAddress -> passport | null).
-  // Lets save / post-mint refresh skip network reads, avoiding both the red
-  // 404 on first-time players AND read-after-write races on the same session.
-  static _passportCache = new Map();
-
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
   // WALLET CONNECTION
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
 
   static async getStandardWallet() {
     const { aptosWallets, on } = getAptosWallets();
 
     const getPreferred = (wallets) => {
-      const petra = wallets.find((w) => w.name.includes("Petra"));
+      const petra = wallets.find(w => w.name.includes("Petra"));
       return petra || (wallets.length > 0 ? wallets[0] : null);
     };
 
@@ -72,12 +67,10 @@ export class ShelbyManager {
       if (!connectFeature) throw new Error("Wallet does not support AIP-62 standard.");
 
       const response = await connectFeature.connect();
-      const rawAddress =
-        response.args?.address || response.account?.address || response.address;
+      const rawAddress = response.args?.address || response.account?.address || response.address;
       if (!rawAddress) throw new Error("Failed to retrieve wallet address.");
 
-      this.walletAddress =
-        typeof rawAddress === "string" ? rawAddress : rawAddress.toString();
+      this.walletAddress = typeof rawAddress === "string" ? rawAddress : rawAddress.toString();
       this.activeWallet = wallet;
       this.isConnected = true;
 
@@ -89,31 +82,47 @@ export class ShelbyManager {
     }
   }
 
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
   // INTERNAL HELPERS
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
 
   static _getSponsorSigner() {
     if (!this.SPONSOR_PRIVATE_KEY_HEX) {
-      throw new Error("Sponsor private key not configured in .env file.");
+      throw new Error("Sponsor private key not configured.");
     }
     const pKey = new Ed25519PrivateKey(this.SPONSOR_PRIVATE_KEY_HEX);
     return Account.fromPrivateKey({ privateKey: pKey });
   }
 
-  // On-chain existence check via aptos.view() — HTTP 200 even when absent, so
-  // it produces NO red 404 in the console (unlike a direct blob GET).
+  // Retry wrapper — backs off on HTTP 429 (rate limit): 1s, 2s, 4s, 8s
+  static async _retryWithBackoff(fn, maxAttempts = 4) {
+    let delay = 1000;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        const is429 = err?.message?.includes("429") || err?.status === 429 || err?.response?.status === 429;
+        if (!is429 || attempt === maxAttempts) throw err;
+        console.warn(`[SHELBY] 429 rate limit — retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})`);
+        await new Promise((r) => setTimeout(r, delay));
+        delay *= 2;
+      }
+    }
+  }
+
+  // On-chain view — always HTTP 200, no red 404 in console
   static async _blobExists(account, name) {
     try {
-      const meta = await this._getClient().coordination.getBlobMetadata({ account, name });
+      const meta = await this._retryWithBackoff(() =>
+        this._getClient().coordination.getBlobMetadata({ account, name })
+      );
       return !!meta;
     } catch (_) {
       return false;
     }
   }
 
-  // Direct blob GET. Returns null on 404, throws on other errors.
-  // Reads the storage layer directly (no indexer) — immune to indexer lag.
+  // Direct storage read — returns null on 404, throws on other errors
   static async _fetchBlob(sponsorAddress, blobName) {
     const url = `${SHELBY_API}/${sponsorAddress}/${blobName}`;
     const res = await fetch(url);
@@ -122,157 +131,75 @@ export class ShelbyManager {
     return res.json();
   }
 
-  // Delete-then-upload. Shelby blobs are immutable — overwriting different bytes
-  // under the same registered name fails with HTTP 400 at multipart /complete.
-  // The 1.5 s pause after deleteBlob lets the node sync before client.upload()
-  // internally re-checks getBlobMetadata().
+  // Delete the old registration, then upload fresh bytes (Shelby blobs are immutable)
   static async _writeBlob(data, blobName, sponsorSigner) {
     const client = this._getClient();
-
     let existsMeta = null;
     try {
-      existsMeta = await client.coordination.getBlobMetadata({
-        account: sponsorSigner.accountAddress,
-        name: blobName,
-      });
+      existsMeta = await this._retryWithBackoff(() =>
+        client.coordination.getBlobMetadata({
+          account: sponsorSigner.accountAddress,
+          name: blobName,
+        })
+      );
     } catch (_) {}
 
     if (existsMeta) {
-      console.log(`[SHELBY] Deleting old ${blobName} registration...`);
+      console.log(`[SHELBY] ${blobName} exists — deleting before rewrite...`);
       const { transaction } = await client.coordination.deleteBlob({
         account: sponsorSigner,
         blobName,
       });
       await client.aptos.waitForTransaction({ transactionHash: transaction.hash });
+      // Brief pause so the RPC node catches up before upload's internal metadata check
       await new Promise((r) => setTimeout(r, 1500));
     }
 
     const blobData = new TextEncoder().encode(JSON.stringify(data));
     const expirationMicros = Date.now() * 1000 + 86400 * 30 * 1_000_000;
-
-    await client.upload({ blobData, signer: sponsorSigner, blobName, expirationMicros });
-    console.log(`[SHELBY] ✅ ${blobName} written → ${SHELBY_API}/${sponsorSigner.accountAddress}/${blobName}`);
+    await this._retryWithBackoff(() =>
+      client.upload({ blobData, signer: sponsorSigner, blobName, expirationMicros })
+    );
   }
 
-  // Merge newRecord into records, keeping personal best per wallet.
   static _mergeRecord(records, newRecord) {
     const map = new Map();
     for (const r of records) {
       if (!r.wallet_address) continue;
-      const ex = map.get(r.wallet_address);
-      if (!ex || r.score > ex.score || (r.score === ex.score && r.time_elapsed < ex.time_elapsed)) {
+      const existing = map.get(r.wallet_address);
+      if (
+        !existing ||
+        r.score > existing.score ||
+        (r.score === existing.score && r.time_elapsed < existing.time_elapsed)
+      ) {
         map.set(r.wallet_address, r);
       }
     }
-    const cur = map.get(newRecord.wallet_address);
-    if (!cur || newRecord.score > cur.score || (newRecord.score === cur.score && newRecord.time_elapsed < cur.time_elapsed)) {
-      map.set(newRecord.wallet_address, newRecord);
+    const wallet = newRecord.wallet_address;
+    const current = map.get(wallet);
+    if (
+      !current ||
+      newRecord.score > current.score ||
+      (newRecord.score === current.score && newRecord.time_elapsed < current.time_elapsed)
+    ) {
+      map.set(wallet, newRecord);
     }
     return Array.from(map.values()).sort(
       (a, b) => b.score - a.score || a.time_elapsed - b.time_elapsed
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // DYNAMIC PASSPORT — fetch (zero red 404, even for first-time players)
-  // ---------------------------------------------------------------------------
-
-  static async fetchPlayerPassport(walletAddress) {
-    try {
-      // Session cache is authoritative — instant, and correct right after a
-      // write (no read-after-write race on the post-mint HUD refresh).
-      if (this._passportCache.has(walletAddress)) {
-        return this._passportCache.get(walletAddress);
-      }
-
-      const sponsorSigner = this._getSponsorSigner();
-      const sponsorAddress = sponsorSigner.accountAddress.toString();
-      const blobName = `${walletAddress}_passport.json`;
-
-      // Existence check via on-chain view (HTTP 200) — no red 404 for new players
-      const exists = await this._blobExists(sponsorSigner.accountAddress, blobName);
-      if (!exists) {
-        console.log(`[PASSPORT] No passport for ${walletAddress.substring(0, 8)}... (first-time player)`);
-        this._passportCache.set(walletAddress, null);
-        return null;
-      }
-
-      const passport = await this._fetchBlob(sponsorAddress, blobName);
-      this._passportCache.set(walletAddress, passport);
-      const best = passport?.attributes?.find((a) => a.trait_type === "Decryption Credits")?.value ?? "?";
-      console.log(`[PASSPORT] ✅ Loaded — best score: ${best} CR`);
-      return passport;
-    } catch (err) {
-      console.warn("[PASSPORT] Failed to fetch passport:", err);
-      return null;
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // DYNAMIC PASSPORT — save (reads prev from cache → no extra network 404)
-  // ---------------------------------------------------------------------------
-
-  static async savePlayerPassport(walletAddress, credits, timeElapsed) {
-    try {
-      const sponsorSigner = this._getSponsorSigner();
-      const blobName = `${walletAddress}_passport.json`;
-
-      // Previous state from the guarded fetch (cache hit, or 200 view-check) —
-      // never a raw blob GET, so no red 404 here.
-      const prev = await this.fetchPlayerPassport(walletAddress);
-
-      const prevCredits = prev?.attributes?.find((a) => a.trait_type === "Decryption Credits")?.value ?? -1;
-      const prevTime    = prev?.attributes?.find((a) => a.trait_type === "Speedrun Time")?.value ?? Infinity;
-      const prevRuns    = prev?.attributes?.find((a) => a.trait_type === "Total Runs")?.value ?? 0;
-
-      const isPersonalBest =
-        credits > prevCredits || (credits === prevCredits && timeElapsed < prevTime);
-
-      const bestCredits = isPersonalBest ? credits : prevCredits;
-      const bestTime    = isPersonalBest ? timeElapsed : (prevTime === Infinity ? timeElapsed : prevTime);
-
-      const passport = {
-        name: "ShelbyWorld Quest — Portal Pass",
-        description:
-          "A dynamic on-chain passport minted via ShelbyWorld Quest. Attributes are mutable and update on every personal-best run — stored on Shelby decentralized hot storage.",
-        image:
-          "https://api.shelbynet.shelby.xyz/shelby/v1/blobs/0x236f14622de45f2f2246df2a0736d6ccbbbbbd23e4c7570ad3378cfdfaa589d5/model/logo.glb",
-        external_url: "https://shelbyworld.netlify.app",
-        attributes: [
-          { trait_type: "Decryption Credits", value: bestCredits },
-          { trait_type: "Speedrun Time",      value: bestTime },
-          { trait_type: "Completed Levels",   value: 1 },
-          { trait_type: "Outpost Secured",    value: "Yes" },
-          { trait_type: "Total Runs",         value: prevRuns + 1 },
-          { trait_type: "Network",            value: "Aptos Testnet" },
-          { trait_type: "Storage Layer",      value: "Shelby Decentralized Storage" },
-        ],
-        wallet_address: walletAddress,
-        last_updated: Date.now(),
-      };
-
-      console.log(
-        `[PASSPORT] ${isPersonalBest ? "NEW PERSONAL BEST" : "Run logged"} — ${walletAddress.substring(0, 8)}... (best: ${bestCredits} CR)`
-      );
-      await this._writeBlob(passport, blobName, sponsorSigner);
-      this._passportCache.set(walletAddress, passport); // refresh cache for instant HUD update
-      return passport;
-    } catch (err) {
-      console.warn("[PASSPORT] Failed to save passport — game continues normally:", err);
-      return null;
-    }
-  }
-
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
   // SUBMIT FINAL SCORE
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
 
-  static async submitFinalScore(credits, timeElapsed) {
+  static async submitFinalScore(credits, timeElapsed, frames = []) {
     if (!this.isConnected || !this.activeWallet) {
       throw new Error("Wallet not connected");
     }
 
     try {
+      // 1. ON-CHAIN MINT (signed by player)
       const txFeature = this.activeWallet.features["aptos:signAndSubmitTransaction"];
       if (!txFeature) throw new Error("Wallet does not support transaction signing.");
 
@@ -284,11 +211,7 @@ export class ShelbyManager {
         },
       });
 
-      const txHash =
-        response.hash ||
-        response.transaction?.hash ||
-        response.args?.hash ||
-        response.id;
+      const txHash = response.hash || response.transaction?.hash || response.args?.hash || response.id;
       if (!txHash) throw new Error("Failed to capture a valid transaction hash.");
 
       console.log("✅ On-chain Mint Tx:", txHash);
@@ -301,27 +224,48 @@ export class ShelbyManager {
         timestamp: Date.now(),
       };
 
+      // Local backup — written first so no score is ever lost
       try {
         localStorage.setItem(`shelby_score_${this.walletAddress}`, JSON.stringify(newRecord));
       } catch (e) {
         console.warn("Local backup write failed:", e);
       }
 
-      // Update unified leaderboard blob (direct fetch — no indexer race)
+      // 2. LEADERBOARD BLOB UPDATE
       try {
         const sponsorSigner = this._getSponsorSigner();
         const sponsorAddress = sponsorSigner.accountAddress.toString();
-
-        const existing = (await this._fetchBlob(sponsorAddress, LEADERBOARD_BLOB)) ?? [];
+        console.log("📥 [SHELBY] Fetching current leaderboard.json...");
+        const existing = await this._fetchBlob(sponsorAddress, LEADERBOARD_BLOB) || [];
         const updated = this._mergeRecord(existing, newRecord);
-        console.log(`[SHELBY] Uploading leaderboard.json (${updated.length} records)...`);
+        console.log(`📤 [SHELBY] Uploading leaderboard.json (${updated.length} records)...`);
         await this._writeBlob(updated, LEADERBOARD_BLOB, sponsorSigner);
+        console.log("✅ [SHELBY] leaderboard.json updated.");
       } catch (shelbyErr) {
-        console.warn("Shelby leaderboard upload failed — mint and local backup still succeeded:", shelbyErr);
+        console.warn("Shelby leaderboard upload failed:", shelbyErr);
       }
 
-      // Sync the player's dynamic passport on Shelby
-      await this.savePlayerPassport(this.walletAddress, credits, timeElapsed);
+      // Brief pause between Shelby operations to avoid rate limit
+      await new Promise((r) => setTimeout(r, 1000));
+
+      // 3. GHOST REPLAY BLOB UPLOAD
+      if (frames.length > 1) {
+        try {
+          await this.saveReplay(this.walletAddress, frames);
+        } catch (replayErr) {
+          console.warn("Ghost replay upload failed (score still saved):", replayErr);
+        }
+      }
+
+      // Brief pause between Shelby operations to avoid rate limit
+      await new Promise((r) => setTimeout(r, 1000));
+
+      // 4. DYNAMIC PASSPORT UPDATE
+      try {
+        await this.savePlayerPassport(this.walletAddress, credits, timeElapsed);
+      } catch (passportErr) {
+        console.warn("Passport update failed (score still saved):", passportErr);
+      }
 
       return txHash;
     } catch (error) {
@@ -330,9 +274,125 @@ export class ShelbyManager {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // FETCH LEADERBOARD — direct read (no indexer, no race)
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // GHOST REPLAY
+  // -------------------------------------------------------------------------
+
+  static async saveReplay(walletAddress, frames) {
+    const sponsorSigner = this._getSponsorSigner();
+    const blobName = `${walletAddress}_replay.json`;
+    const data = { wallet_address: walletAddress, frames };
+    console.log(`📤 [SHELBY] Uploading ghost replay (${frames.length} frames)...`);
+    await this._writeBlob(data, blobName, sponsorSigner);
+    console.log("✅ [SHELBY] Ghost replay saved.");
+  }
+
+  static async fetchReplay(walletAddress) {
+    try {
+      const sponsorSigner = this._getSponsorSigner();
+      const sponsorAddress = sponsorSigner.accountAddress.toString();
+      const blobName = `${walletAddress}_replay.json`;
+
+      // Check existence first — avoids a red 404 for players who never submitted a replay
+      const exists = await this._blobExists(sponsorSigner.accountAddress, blobName);
+      if (!exists) {
+        console.log(`[SHELBY] No replay found for ${walletAddress}`);
+        return null;
+      }
+
+      console.log(`🔍 [SHELBY] Fetching replay for ${walletAddress}...`);
+      return await this._fetchBlob(sponsorAddress, blobName);
+    } catch (error) {
+      console.warn("fetchReplay failed:", error);
+      return null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // DYNAMIC NFT PASSPORT
+  // -------------------------------------------------------------------------
+
+  static _attr(passport, traitType) {
+    return passport?.attributes?.find(a => a.trait_type === traitType)?.value;
+  }
+
+  static async fetchPlayerPassport(walletAddress) {
+    // Check session cache first — instant and avoids repeat network reads
+    if (this._passportCache.has(walletAddress)) {
+      return this._passportCache.get(walletAddress);
+    }
+
+    try {
+      const sponsorSigner = this._getSponsorSigner();
+      const blobName = `${walletAddress}_passport.json`;
+
+      // On-chain view — always HTTP 200, no red 404 for first-time players
+      const exists = await this._blobExists(sponsorSigner.accountAddress, blobName);
+      if (!exists) {
+        this._passportCache.set(walletAddress, null);
+        return null;
+      }
+
+      const sponsorAddress = sponsorSigner.accountAddress.toString();
+      const passport = await this._fetchBlob(sponsorAddress, blobName);
+      this._passportCache.set(walletAddress, passport);
+      return passport;
+    } catch (e) {
+      console.warn("fetchPlayerPassport failed:", e);
+      return null;
+    }
+  }
+
+  static async savePlayerPassport(walletAddress, credits, timeElapsed) {
+    try {
+      const sponsorSigner = this._getSponsorSigner();
+      const blobName = `${walletAddress}_passport.json`;
+
+      // Load existing passport (cache hit if already read this session)
+      const existing = await this.fetchPlayerPassport(walletAddress);
+
+      const prevBestScore = this._attr(existing, "Best Score");
+      const prevBestTime = this._attr(existing, "Best Time (s)");
+      const prevRuns = this._attr(existing, "Total Runs") || 0;
+
+      const isNewPB =
+        prevBestScore == null ||
+        credits > prevBestScore ||
+        (credits === prevBestScore && timeElapsed < prevBestTime);
+
+      const bestScore = isNewPB ? credits : prevBestScore;
+      const bestTime = isNewPB ? timeElapsed : prevBestTime;
+
+      const passport = {
+        name: `ShelbyWorld Passport — ${walletAddress.substring(0, 8)}`,
+        description: "Verifiable on-chain run record for ShelbyWorld Quest, stored on Shelby decentralized storage.",
+        external_url: "https://shelbyworld.xyz",
+        attributes: [
+          { trait_type: "Best Score", value: bestScore },
+          { trait_type: "Best Time (s)", value: bestTime },
+          { trait_type: "Total Runs", value: prevRuns + 1 },
+          { trait_type: "Last Score", value: credits },
+          { trait_type: "Outpost Status", value: "CLEARED" },
+          { trait_type: "Last Updated", value: new Date().toISOString() },
+        ],
+      };
+
+      await this._writeBlob(passport, blobName, sponsorSigner);
+
+      // Update cache so the badge refreshes instantly
+      this._passportCache.set(walletAddress, passport);
+      console.log("✅ [SHELBY] Passport updated for", walletAddress);
+
+      return passport;
+    } catch (e) {
+      console.warn("savePlayerPassport failed:", e);
+      return null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // FETCH LEADERBOARD
+  // -------------------------------------------------------------------------
 
   static async fetchLeaderboard() {
     try {
@@ -341,11 +401,11 @@ export class ShelbyManager {
 
       const records = await this._fetchBlob(sponsorAddress, LEADERBOARD_BLOB);
       if (!records) {
-        console.log("[SHELBY] No leaderboard.json yet — empty leaderboard.");
+        console.log("[SHELBY] No leaderboard.json yet — starting empty.");
         return this.mergeWithLocalBackup([]);
       }
 
-      console.log(`[SHELBY] Loaded ${records.length} records from leaderboard.json.`);
+      console.log(`📦 [SHELBY] Loaded ${records.length} records.`);
       const sorted = [...records].sort(
         (a, b) => b.score - a.score || a.time_elapsed - b.time_elapsed
       );
@@ -356,16 +416,17 @@ export class ShelbyManager {
     }
   }
 
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
   // LOCAL BACKUP MERGE
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
 
   static mergeWithLocalBackup(liveRecords) {
     if (!this.walletAddress) return liveRecords;
     try {
       const raw = localStorage.getItem(`shelby_score_${this.walletAddress}`);
       if (!raw) return liveRecords;
-      return this._mergeRecord(liveRecords, JSON.parse(raw));
+      const local = JSON.parse(raw);
+      return this._mergeRecord(liveRecords, local);
     } catch (e) {
       console.warn("Failed to merge local backup:", e);
       return liveRecords;

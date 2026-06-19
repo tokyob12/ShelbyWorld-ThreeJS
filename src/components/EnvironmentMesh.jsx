@@ -3,78 +3,106 @@ import { useGLTF, Html } from '@react-three/drei';
 import { RigidBody } from '@react-three/rapier';
 import { SHELBY_URLS } from '../constants/urls';
 
-// =========================================================================
-// STABLE NATIVE BLOB FETCH (100% Shelby-Native & HTTP/2 Safe)
-// Uses the browser's native background network engine to download the blob.
-// This prevents main-thread JS delays from causing HTTP/2 RST_STREAM timeouts.
-// =========================================================================
-async function fetchStreamedBlob(url, onProgress) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch. Status: ${response.status}`);
+async function fetchWithRetry(url, maxAttempts = 4) {
+  let delay = 1500;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const blob = await response.blob();
+      if (blob.size === 0) throw new Error("Empty response body");
+      return blob;
+    } catch (err) {
+      const isRetryable =
+        err.message.includes("Failed to fetch") ||
+        err.message.includes("ERR_HTTP2") ||
+        err.message.includes("network") ||
+        err.message.includes("Empty response");
+
+      if (!isRetryable || attempt === maxAttempts) throw err;
+
+      console.warn(`[SHELBY] Environment fetch attempt ${attempt} failed — retrying in ${delay}ms...`, err.message);
+      await new Promise((r) => setTimeout(r, delay));
+      delay *= 1.5;
+    }
   }
-  
-  // Leverage native browser-optimized engine instead of custom getReader() loops
-  const blob = await response.blob();
-  if (onProgress) onProgress(100); // Instantly set loading to 100% when finished
-  return blob;
 }
 
 export default function EnvironmentMesh({ onEnvironmentLoaded }) {
   const [blobUrl, setBlobUrl] = useState(null);
   const [error, setError] = useState(null);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let active = true;
     let localUrl = null;
 
-    // Fetch directly from the Shelby Storage Network
-    fetchStreamedBlob(SHELBY_URLS.environment)
+    fetchWithRetry(SHELBY_URLS.environment)
       .then((blob) => {
         if (!active) return;
         localUrl = URL.createObjectURL(blob);
         setBlobUrl(localUrl);
-        onEnvironmentLoaded(true); // Unlock start button
+        onEnvironmentLoaded(true);
       })
       .catch((err) => {
         if (!active) return;
-        console.error("Shelby streaming failed:", err);
+        console.error("Shelby environment load failed after all retries:", err);
         setError(err);
       });
 
     return () => {
       active = false;
-      if (localUrl) {
-        URL.revokeObjectURL(localUrl);
-      }
+      if (localUrl) URL.revokeObjectURL(localUrl);
     };
-  }, [onEnvironmentLoaded]);
+  }, [onEnvironmentLoaded, attempt]);
 
   if (error) {
     return (
-      <Html center style={{ pointerEvents: 'none' }}>
+      <Html center style={{ pointerEvents: 'auto' }}>
         <div style={{
-          backgroundColor: 'rgba(255, 68, 68, 0.95)',
+          backgroundColor: 'rgba(10, 10, 30, 0.95)',
           color: 'white',
-          border: '2px solid #ff4444',
-          padding: '16px 24px',
+          border: '2px solid var(--shelby-cyan, #00e5ff)',
+          padding: '20px 28px',
           borderRadius: '4px',
           fontSize: '14px',
-          fontWeight: 'bold',
-          letterSpacing: '1px',
           fontFamily: 'Space Grotesk, sans-serif',
           whiteSpace: 'nowrap',
-          boxShadow: '0 0 15px rgba(255, 68, 68, 0.4)'
+          boxShadow: '0 0 15px rgba(0, 229, 255, 0.3)',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: '12px',
         }}>
-          SHELBY OUTPOST STREAM ABORTED (HTTP/2 LIMIT EXCEEDED)
+          <div style={{ fontWeight: 'bold', letterSpacing: '1px', color: '#ff6b6b' }}>
+            SHELBY STREAM INTERRUPTED
+          </div>
+          <div style={{ fontSize: '12px', color: '#8892b0' }}>
+            Connection dropped while loading environment
+          </div>
+          <button
+            onClick={() => { setError(null); setAttempt(a => a + 1); }}
+            style={{
+              background: 'var(--shelby-cyan, #00e5ff)',
+              color: 'black',
+              border: 'none',
+              padding: '8px 20px',
+              borderRadius: '4px',
+              fontFamily: 'Space Grotesk, sans-serif',
+              fontWeight: 'bold',
+              fontSize: '12px',
+              letterSpacing: '1px',
+              cursor: 'pointer',
+            }}
+          >
+            RETRY
+          </button>
         </div>
       </Html>
     );
   }
 
-  if (!blobUrl) {
-    return null;
-  }
+  if (!blobUrl) return null;
 
   return <EnvironmentMeshRenderer url={blobUrl} />;
 }
@@ -87,7 +115,6 @@ function EnvironmentMeshRenderer({ url }) {
       if (node.isMesh) {
         node.castShadow = true;
         node.receiveShadow = true;
-        
         if (node.material) {
           node.material.roughness = Math.max(node.material.roughness, 0.4);
           node.material.metalness = Math.min(node.material.metalness, 0.2);
