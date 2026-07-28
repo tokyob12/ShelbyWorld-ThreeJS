@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "upload:models": "bash scripts/upload-models.sh"
   },
   "dependencies": {
     "@aptos-labs/ts-sdk": "^7.1.0",

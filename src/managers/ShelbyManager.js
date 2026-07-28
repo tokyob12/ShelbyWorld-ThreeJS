@@ -1,8 +1,26 @@
 import { getAptosWallets } from "@aptos-labs/wallet-standard";
-import { ShelbyClient } from "@shelby-protocol/sdk/browser";
-import { Account, Ed25519PrivateKey } from "@aptos-labs/ts-sdk";
+import {
+  ShelbyClient,
+  NetworkToShelbyRPCBaseUrl,
+  isBlobNotFoundError,
+} from "@shelby-protocol/sdk/browser";
+import { Account, Ed25519PrivateKey, Network } from "@aptos-labs/ts-sdk";
 
-const SHELBY_API = "https://api.shelbynet.shelby.xyz/shelby/v1/blobs";
+// Stay on shelbynet by default (matches CLI default_context). Override with VITE_SHELBY_NETWORK=testnet when migrating.
+const SHELBY_NETWORK =
+  import.meta.env.VITE_SHELBY_NETWORK === "testnet"
+    ? Network.TESTNET
+    : Network.SHELBYNET;
+
+const SHELBY_API_KEY = import.meta.env.VITE_SHELBY_API_KEY;
+const SHELBY_RPC_BASE =
+  NetworkToShelbyRPCBaseUrl[SHELBY_NETWORK] ??
+  NetworkToShelbyRPCBaseUrl[Network.SHELBYNET];
+const SHELBY_API = `${SHELBY_RPC_BASE}/v1/blobs`;
+
+// Expiration is required on every Shelby upload (CLI --expiration / SDK expirationMicros).
+// Docs formula: (durationMs + Date.now()) * 1000 → microseconds since epoch.
+const BLOB_TTL_DAYS = 365;
 const LEADERBOARD_BLOB = "leaderboard.json";
 
 export class ShelbyManager {
@@ -17,8 +35,18 @@ export class ShelbyManager {
   static _passportCache = new Map();
 
   static _getClient() {
-    if (!this._client) this._client = new ShelbyClient({ network: "shelbynet" });
+    if (!this._client) {
+      this._client = new ShelbyClient({
+        network: SHELBY_NETWORK,
+        // Geomi / Shelby API key — avoids anonymous rate limits (see acquire-api-keys docs)
+        ...(SHELBY_API_KEY ? { apiKey: SHELBY_API_KEY } : {}),
+      });
+    }
     return this._client;
+  }
+
+  static _expirationMicros(days = BLOB_TTL_DAYS) {
+    return (days * 24 * 60 * 60 * 1000 + Date.now()) * 1000;
   }
 
   // -------------------------------------------------------------------------
@@ -122,13 +150,36 @@ export class ShelbyManager {
     }
   }
 
-  // Direct storage read — returns null on 404, throws on other errors
+  // SDK download (sends API key) — returns null on missing blob
   static async _fetchBlob(sponsorAddress, blobName) {
-    const url = `${SHELBY_API}/${sponsorAddress}/${blobName}`;
-    const res = await fetch(url);
-    if (res.status === 404) return null;
-    if (!res.ok) throw new Error(`Failed to fetch ${blobName}: ${res.status}`);
-    return res.json();
+    try {
+      const shelbyBlob = await this._retryWithBackoff(() =>
+        this._getClient().download({
+          account: sponsorAddress,
+          blobName,
+        })
+      );
+      const text = await new Response(shelbyBlob.readable).text();
+      return JSON.parse(text);
+    } catch (err) {
+      const msg = err?.message || String(err);
+      if (
+        isBlobNotFoundError(msg) ||
+        msg.includes("404") ||
+        msg.toLowerCase().includes("not found")
+      ) {
+        return null;
+      }
+      // Fallback GET for environments where stream download fails
+      const url = `${SHELBY_API}/${sponsorAddress}/${blobName}`;
+      const headers = SHELBY_API_KEY
+        ? { Authorization: `Bearer ${SHELBY_API_KEY}` }
+        : undefined;
+      const res = await fetch(url, headers ? { headers } : undefined);
+      if (res.status === 404) return null;
+      if (!res.ok) throw new Error(`Failed to fetch ${blobName}: ${res.status}`);
+      return res.json();
+    }
   }
 
   // Delete the old registration, then upload fresh bytes (Shelby blobs are immutable)
@@ -156,9 +207,15 @@ export class ShelbyManager {
     }
 
     const blobData = new TextEncoder().encode(JSON.stringify(data));
-    const expirationMicros = Date.now() * 1000 + 86400 * 30 * 1_000_000;
+    const expirationMicros = this._expirationMicros();
+    // SDK 0.3.1 still uses `signer`; newer docs rename this to `account`
     await this._retryWithBackoff(() =>
-      client.upload({ blobData, signer: sponsorSigner, blobName, expirationMicros })
+      client.upload({
+        blobData,
+        signer: sponsorSigner,
+        blobName,
+        expirationMicros,
+      })
     );
   }
 
